@@ -39,9 +39,52 @@ const API_TOKEN = process.env.API_TOKEN || ''; // se vazio, roda sem checagem (d
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 
+// Config pra resolver LID -> telefone via banco (fallback quando o Baileys não resolve sozinho)
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const CLINICA_ID = process.env.CLINICA_ID || ''; // esta instância Baileys é dedicada a UMA clínica
+
 let sock = null;
 let latestQR = null;
 let isConnected = false;
+
+// ---------- Consulta se já sabemos o telefone real por trás desse LID ----------
+async function buscarPacientePorLid(lid) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !CLINICA_ID) return null;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/pacientes?select=id,telefone&whatsapp_lid=eq.${encodeURIComponent(lid)}&clinica_id=eq.${CLINICA_ID}&limit=1`;
+    const res = await fetch(url, {
+      headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` },
+    });
+    const data = await res.json();
+    return Array.isArray(data) && data[0] ? data[0] : null;
+  } catch (e) {
+    console.error('[Supabase] Erro ao buscar paciente por LID:', e.message || e);
+    return null;
+  }
+}
+
+// ---------- Guarda a mensagem sem dono, pra recepção vincular manualmente depois ----------
+async function registrarMensagemNaoIdentificada(lid, mensagem) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !CLINICA_ID) {
+    console.warn('[Supabase] SUPABASE_URL/SUPABASE_SERVICE_KEY/CLINICA_ID não configurados — mensagem de LID desconhecido descartada.');
+    return;
+  }
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/mensagens_nao_identificadas`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ clinica_id: CLINICA_ID, lid, mensagem }),
+    });
+  } catch (e) {
+    console.error('[Supabase] Erro ao registrar mensagem não identificada:', e.message || e);
+  }
+}
 
 // ---------- Middleware simples de autenticação por token ----------
 function checkAuth(req, res, next) {
@@ -157,16 +200,8 @@ async function startSock() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue; // ignora as que o próprio bot mandou
 
-      const jid = await resolveRealJid(msg);
+      let jid = await resolveRealJid(msg);
       if (!jid || jid.endsWith('@g.us')) continue; // ignora grupos por enquanto
-
-      if (jid.endsWith('@lid')) {
-        // Não veio remoteJidAlt/participantAlt — não temos como saber o telefone real.
-        // Loga pra você identificar esses casos e decidir depois (ex: pedir o número
-        // por outro canal, ou tratar handshake inicial diferente).
-        console.warn('[Baileys] Mensagem recebida com @lid sem JID real disponível:', JSON.stringify(msg.key));
-        continue;
-      }
 
       const texto =
         msg.message.conversation ||
@@ -174,6 +209,19 @@ async function startSock() {
         msg.message.buttonsResponseMessage?.selectedDisplayText ||
         msg.message.listResponseMessage?.title ||
         '';
+
+      if (jid.endsWith('@lid')) {
+        const lidDigits = jidToPhone(jid);
+        const pacienteEncontrado = await buscarPacientePorLid(lidDigits);
+        if (pacienteEncontrado && pacienteEncontrado.telefone) {
+          // Já vinculamos esse LID a um paciente antes (via dashboard) — usa o telefone real dele
+          jid = toWhatsAppJid(pacienteEncontrado.telefone);
+        } else {
+          console.warn('[Baileys] LID sem paciente vinculado ainda — registrando para vínculo manual:', lidDigits);
+          await registrarMensagemNaoIdentificada(lidDigits, texto);
+          continue;
+        }
+      }
 
       await forwardToN8n({
         phone: jidToPhone(jid),
