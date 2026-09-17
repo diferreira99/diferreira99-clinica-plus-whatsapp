@@ -28,6 +28,8 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  initAuthCreds,
+  BufferJSON,
 } = require('@whiskeysockets/baileys');
 
 const app = express();
@@ -151,11 +153,102 @@ async function forwardToN8n(payload) {
   }
 }
 
+// ---------- Sessão do WhatsApp persistida no Supabase (sem depender de Volume) ----------
+async function carregarSessaoSalva() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !CLINICA_ID) return null;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/whatsapp_sessions?select=creds,keys_data&clinica_id=eq.${CLINICA_ID}&limit=1`;
+    const res = await fetch(url, {
+      headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` },
+    });
+    const data = await res.json();
+    return Array.isArray(data) && data[0] ? data[0] : null;
+  } catch (e) {
+    console.error('[Supabase] Erro ao carregar sessão salva:', e.message || e);
+    return null;
+  }
+}
+
+async function salvarSessao(creds, keysData) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !CLINICA_ID) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/whatsapp_sessions?on_conflict=clinica_id`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=minimal',
+      },
+      body: JSON.stringify({
+        clinica_id: CLINICA_ID,
+        creds: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)),
+        keys_data: keysData,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+  } catch (e) {
+    console.error('[Supabase] Erro ao salvar sessão:', e.message || e);
+  }
+}
+
+// Implementa a mesma interface que o Baileys espera de useMultiFileAuthState,
+// mas guardando tudo no Supabase em vez de arquivos locais no disco do container.
+async function useSupabaseAuthState() {
+  const salvo = await carregarSessaoSalva();
+  const creds = salvo?.creds
+    ? JSON.parse(JSON.stringify(salvo.creds), BufferJSON.reviver)
+    : initAuthCreds();
+  const keysData = salvo?.keys_data || {};
+
+  const persistir = () => salvarSessao(creds, keysData);
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const resultado = {};
+          for (const id of ids) {
+            const valor = keysData[type]?.[id];
+            if (valor !== undefined) resultado[id] = valor;
+          }
+          return resultado;
+        },
+        set: async (data) => {
+          for (const type in data) {
+            keysData[type] = keysData[type] || {};
+            for (const id in data[type]) {
+              const valor = data[type][id];
+              if (valor === null) {
+                delete keysData[type][id];
+              } else {
+                keysData[type][id] = valor;
+              }
+            }
+          }
+          await persistir();
+        },
+      },
+    },
+    saveCreds: persistir,
+  };
+}
+
 // ---------- Conexão com o WhatsApp ----------
 async function startSock() {
-  if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+  const usarSupabase = !!(SUPABASE_URL && SUPABASE_SERVICE_KEY && CLINICA_ID);
+  let state, saveCreds;
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  if (usarSupabase) {
+    console.log('[Baileys] Persistindo sessão no Supabase (sem Volume).');
+    ({ state, saveCreds } = await useSupabaseAuthState());
+  } else {
+    console.warn('[Baileys] SUPABASE_URL/SUPABASE_SERVICE_KEY/CLINICA_ID ausentes — usando arquivo local (não sobrevive a redeploy sem Volume).');
+    if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+    ({ state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER));
+  }
+
   const { version } = await fetchLatestBaileysVersion();
   console.log('[Baileys] Usando versão do protocolo WA:', version);
 
