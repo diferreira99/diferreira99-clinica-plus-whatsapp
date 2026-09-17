@@ -67,14 +67,28 @@ function jidToPhone(jid) {
 
 // ---------- Resolve o JID "de verdade" (telefone) mesmo quando vem como @lid ----------
 // Em alguns casos o WhatsApp manda o remoteJid como "xxxxx@lid" (Linked ID) em vez do
-// número de telefone (...@s.whatsapp.net). O Baileys 6.7+ costuma trazer o JID real
-// em key.remoteJidAlt (ou key.participantAlt em mensagens dentro de grupo/contexto).
-function resolveRealJid(msg) {
+// número de telefone (...@s.whatsapp.net). Tenta, nessa ordem:
+//   1. key.remoteJidAlt / key.participantAlt (quando o próprio Baileys já resolve)
+//   2. a tabela interna de mapeamento LID->PN do signalRepository (se existir nesta versão)
+async function resolveRealJid(msg) {
   const jid = msg.key.remoteJid;
-  if (jid && jid.endsWith('@lid')) {
-    return msg.key.remoteJidAlt || msg.key.participantAlt || jid;
+  if (!jid || !jid.endsWith('@lid')) return jid;
+
+  if (msg.key.remoteJidAlt || msg.key.participantAlt) {
+    return msg.key.remoteJidAlt || msg.key.participantAlt;
   }
-  return jid;
+
+  try {
+    const lidMapping = sock?.signalRepository?.lidMapping;
+    if (lidMapping?.getPNForLID) {
+      const pn = await lidMapping.getPNForLID(jid);
+      if (pn) return pn;
+    }
+  } catch (e) {
+    console.warn('[Baileys] Falha ao consultar lidMapping:', e.message || e);
+  }
+
+  return jid; // não achou de jeito nenhum — segue como @lid mesmo
 }
 
 // ---------- Encaminha mensagem recebida pro n8n ----------
@@ -143,7 +157,7 @@ async function startSock() {
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue; // ignora as que o próprio bot mandou
 
-      const jid = resolveRealJid(msg);
+      const jid = await resolveRealJid(msg);
       if (!jid || jid.endsWith('@g.us')) continue; // ignora grupos por enquanto
 
       if (jid.endsWith('@lid')) {
